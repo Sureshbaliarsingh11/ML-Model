@@ -7,7 +7,6 @@ app.py
 Main Streamlit application — the entry point for the AutoML platform.
 Run with: streamlit run app.py
 """
-
 import streamlit as st
 import pandas as pd
 
@@ -211,5 +210,405 @@ if st.session_state.df is not None:
 
 else:
     st.info("👆 Upload a CSV or Excel file to get started.")
+
+    """
+models.py
+Defines the algorithm registry (classification + regression), trains every
+candidate model inside a consistent pipeline, and produces a leaderboard
+of evaluation metrics.
+"""
+
+import time
+import numpy as np
+import pandas as pd
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression, Ridge, Lasso
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, GradientBoostingRegressor
+from sklearn.svm import SVC
+from xgboost import XGBClassifier, XGBRegressor
+from lightgbm import LGBMClassifier, LGBMRegressor
+
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score, roc_auc_score,
+    mean_squared_error, mean_absolute_error, r2_score, mean_absolute_percentage_error
+)
+
+from preprocessing import build_preprocessing_pipeline
+
+
+# ---------------------------------------------------------------------------
+# Algorithm registry
+# Each entry: rank, display name, rating (stars), short rationale, and the
+# sklearn-compatible estimator with sensible default hyperparameters for
+# small tabular datasets (<10k rows).
+# ---------------------------------------------------------------------------
+
+CLASSIFICATION_MODELS = {
+    "Random Forest": {
+        "rank": 1,
+        "rating": "★★★★★",
+        "why": "Robust default, handles mixed data well, minimal tuning needed.",
+        "estimator": RandomForestClassifier(
+            n_estimators=300, max_depth=12, min_samples_leaf=2,
+            random_state=42, n_jobs=-1
+        )
+    },
+    "XGBoost": {
+        "rank": 2,
+        "rating": "★★★★★",
+        "why": "Typically the strongest raw accuracy on small/medium tabular data.",
+        "estimator": XGBClassifier(
+            n_estimators=300, max_depth=6, learning_rate=0.1,
+            random_state=42, eval_metric="logloss"
+        )
+    },
+    "Logistic Regression": {
+        "rank": 3,
+        "rating": "★★★★",
+        "why": "Highly interpretable baseline, fast, good when relationships are linear.",
+        "estimator": LogisticRegression(max_iter=1000, random_state=42)
+    },
+    "LightGBM": {
+        "rank": 4,
+        "rating": "★★★★",
+        "why": "Similar strength to XGBoost; can be less stable on very small datasets.",
+        "estimator": LGBMClassifier(
+            n_estimators=300, max_depth=6, learning_rate=0.1,
+            random_state=42, verbose=-1
+        )
+    },
+    "SVM": {
+        "rank": 5,
+        "rating": "★★★",
+        "why": "Effective on small, clean datasets but slower and less interpretable.",
+        "estimator": SVC(probability=True, random_state=42)
+    },
+}
+
+REGRESSION_MODELS = {
+    "Random Forest": {
+        "rank": 1,
+        "rating": "★★★★★",
+        "why": "Robust default, minimal tuning, handles non-linear relationships well.",
+        "estimator": RandomForestRegressor(
+            n_estimators=300, max_depth=12, min_samples_leaf=2,
+            random_state=42, n_jobs=-1
+        )
+    },
+    "XGBoost": {
+        "rank": 2,
+        "rating": "★★★★★",
+        "why": "Highest typical accuracy ceiling for small/medium tabular regression.",
+        "estimator": XGBRegressor(
+            n_estimators=300, max_depth=6, learning_rate=0.1, random_state=42
+        )
+    },
+    "Ridge Regression": {
+        "rank": 3,
+        "rating": "★★★★",
+        "why": "Interpretable, fast, strong baseline, resistant to overfitting.",
+        "estimator": Ridge(alpha=1.0, random_state=42)
+    },
+    "Gradient Boosting": {
+        "rank": 4,
+        "rating": "★★★★",
+        "why": "Strong accuracy but slower to train than XGBoost on larger sets.",
+        "estimator": GradientBoostingRegressor(
+            n_estimators=300, max_depth=4, learning_rate=0.1, random_state=42
+        )
+    },
+    "Lasso": {
+        "rank": 5,
+        "rating": "★★★",
+        "why": "Useful when automatic feature selection (sparsity) matters.",
+        "estimator": Lasso(alpha=0.01, random_state=42)
+    },
+}
+
+
+def get_model_registry(problem_type: str) -> dict:
+    return CLASSIFICATION_MODELS if problem_type == "classification" else REGRESSION_MODELS
+
+
+def train_and_evaluate_all(
+    X: pd.DataFrame,
+    y,
+    problem_type: str,
+    numeric_cols: list,
+    categorical_cols: list,
+    scale_numeric: bool = True,
+    test_size: float = 0.2
+):
+    """
+    Trains every model in the registry inside a full preprocessing + model
+    pipeline, evaluates on a held-out test split, and returns:
+        - leaderboard: DataFrame sorted by primary metric
+        - trained_pipelines: dict of {model_name: fitted Pipeline}
+    """
+    registry = get_model_registry(problem_type)
+
+    stratify = y if problem_type == "classification" else None
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=test_size, random_state=42, stratify=stratify
+    )
+
+    results = []
+    trained_pipelines = {}
+
+    for name, config in registry.items():
+        preprocessor = build_preprocessing_pipeline(numeric_cols, categorical_cols, scale_numeric)
+        pipeline = Pipeline(steps=[
+            ("preprocessor", preprocessor),
+            ("model", config["estimator"])
+        ])
+
+        start = time.time()
+        try:
+            pipeline.fit(X_train, y_train)
+            train_time = round(time.time() - start, 3)
+
+            y_pred = pipeline.predict(X_test)
+
+            if problem_type == "classification":
+                metrics = _classification_metrics(pipeline, X_test, y_test, y_pred)
+            else:
+                metrics = _regression_metrics(y_test, y_pred)
+
+            metrics.update({
+                "Model": name,
+                "Rating": config["rating"],
+                "Training Time (s)": train_time
+            })
+            results.append(metrics)
+            trained_pipelines[name] = pipeline
+
+        except Exception as e:
+            results.append({
+                "Model": name,
+                "Rating": config["rating"],
+                "Training Time (s)": None,
+                "Error": str(e)
+            })
+
+    leaderboard = pd.DataFrame(results)
+
+    primary_metric = "F1 Score" if problem_type == "classification" else "R2"
+    if primary_metric in leaderboard.columns:
+        leaderboard = leaderboard.sort_values(primary_metric, ascending=False).reset_index(drop=True)
+
+    return leaderboard, trained_pipelines, (X_test, y_test)
+
+
+def _classification_metrics(pipeline, X_test, y_test, y_pred) -> dict:
+    n_classes = len(np.unique(y_test))
+    average = "binary" if n_classes == 2 else "macro"
+
+    metrics = {
+        "Accuracy": round(accuracy_score(y_test, y_pred), 4),
+        "Precision": round(precision_score(y_test, y_pred, average=average, zero_division=0), 4),
+        "Recall": round(recall_score(y_test, y_pred, average=average, zero_division=0), 4),
+        "F1 Score": round(f1_score(y_test, y_pred, average=average, zero_division=0), 4),
+    }
+
+    try:
+        if hasattr(pipeline, "predict_proba"):
+            y_proba = pipeline.predict_proba(X_test)
+            if n_classes == 2:
+                metrics["ROC AUC"] = round(roc_auc_score(y_test, y_proba[:, 1]), 4)
+            else:
+                metrics["ROC AUC"] = round(roc_auc_score(y_test, y_proba, multi_class="ovr"), 4)
+    except Exception:
+        metrics["ROC AUC"] = None
+
+    return metrics
+
+
+def _regression_metrics(y_test, y_pred) -> dict:
+    rmse = round(np.sqrt(mean_squared_error(y_test, y_pred)), 4)
+    mae = round(mean_absolute_error(y_test, y_pred), 4)
+    r2 = round(r2_score(y_test, y_pred), 4)
+
+    try:
+        mape = round(mean_absolute_percentage_error(y_test, y_pred) * 100, 2)
+    except Exception:
+        mape = None
+
+    return {"RMSE": rmse, "MAE": mae, "MAPE (%)": mape, "R2": r2}
+
 pip install -r requirements.txt
-streamlit run app.py    
+streamlit run app.py   
+
+"""
+preprocessing.py
+Handles data quality checks, missing value treatment, encoding, scaling,
+and class imbalance correction for the AutoML platform.
+"""
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler, LabelEncoder, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+
+
+def detect_problem_type(df: pd.DataFrame, target_col: str) -> str:
+    """
+    Auto-detects whether the target column implies a classification
+    or regression problem.
+
+    Heuristic:
+    - Non-numeric dtype -> classification
+    - Numeric but few unique values relative to row count -> classification
+    - Otherwise -> regression
+    """
+    target = df[target_col]
+    n_rows = len(df)
+    n_unique = target.nunique(dropna=True)
+
+    if not pd.api.types.is_numeric_dtype(target):
+        return "classification"
+
+    # Numeric column with low cardinality is likely a coded category (e.g., 0/1, 1-5 rating)
+    if n_unique <= 20 or (n_unique / n_rows) < 0.05:
+        return "classification"
+
+    return "regression"
+
+
+def get_missing_value_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """Returns a summary table of missing values per column."""
+    missing = df.isnull().sum()
+    pct = (missing / len(df) * 100).round(2)
+    summary = pd.DataFrame({
+        "column": df.columns,
+        "missing_count": missing.values,
+        "missing_pct": pct.values,
+        "dtype": df.dtypes.astype(str).values
+    })
+    return summary[summary["missing_count"] > 0].sort_values("missing_pct", ascending=False)
+
+
+def handle_missing_values(df: pd.DataFrame, strategy: str, columns_to_drop: list = None) -> pd.DataFrame:
+    """
+    Applies the user-chosen missing value strategy.
+
+    strategy options:
+        - "drop_rows": drop any row with a missing value
+        - "impute": mean/median for numeric, mode for categorical
+        - "drop_columns": drop the specified columns_to_drop entirely
+    """
+    df = df.copy()
+
+    if strategy == "drop_columns" and columns_to_drop:
+        df = df.drop(columns=columns_to_drop)
+        # Any remaining missing values get imputed as a safety net
+        strategy = "impute"
+
+    if strategy == "drop_rows":
+        df = df.dropna()
+
+    elif strategy == "impute":
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        categorical_cols = df.select_dtypes(exclude=[np.number]).columns
+
+        for col in numeric_cols:
+            if df[col].isnull().any():
+                df[col] = df[col].fillna(df[col].median())
+
+        for col in categorical_cols:
+            if df[col].isnull().any():
+                mode_val = df[col].mode()
+                fill_val = mode_val[0] if not mode_val.empty else "Unknown"
+                df[col] = df[col].fillna(fill_val)
+
+    return df
+
+
+def detect_outliers_iqr(df: pd.DataFrame, numeric_cols: list) -> pd.DataFrame:
+    """Returns a summary of outlier counts per numeric column using IQR method."""
+    rows = []
+    for col in numeric_cols:
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        n_outliers = ((df[col] < lower) | (df[col] > upper)).sum()
+        rows.append({"column": col, "outlier_count": n_outliers, "lower_bound": lower, "upper_bound": upper})
+    return pd.DataFrame(rows)
+
+
+def cap_outliers(df: pd.DataFrame, numeric_cols: list) -> pd.DataFrame:
+    """Caps outliers to the IQR bounds (winsorization) instead of dropping rows."""
+    df = df.copy()
+    for col in numeric_cols:
+        q1 = df[col].quantile(0.25)
+        q3 = df[col].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        df[col] = df[col].clip(lower=lower, upper=upper)
+    return df
+
+
+def build_preprocessing_pipeline(numeric_cols: list, categorical_cols: list, scale_numeric: bool = True):
+    """
+    Builds a sklearn ColumnTransformer that one-hot encodes categoricals
+    and optionally scales numeric features. Used inside model pipelines
+    so the same transform is applied consistently at train and predict time.
+    """
+    numeric_steps = [("imputer", SimpleImputer(strategy="median"))]
+    if scale_numeric:
+        numeric_steps.append(("scaler", StandardScaler()))
+    numeric_transformer = Pipeline(steps=numeric_steps)
+
+    categorical_transformer = Pipeline(steps=[
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+    ])
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric_transformer, numeric_cols),
+            ("cat", categorical_transformer, categorical_cols)
+        ],
+        remainder="drop"
+    )
+
+    return preprocessor
+
+
+def encode_target(y: pd.Series):
+    """
+    Label encodes a classification target if it's non-numeric.
+    Returns the encoded target and the fitted encoder (or None for regression/numeric targets).
+    """
+    if not pd.api.types.is_numeric_dtype(y):
+        le = LabelEncoder()
+        y_encoded = le.fit_transform(y)
+        return y_encoded, le
+    return y.values, None
+
+
+def check_class_imbalance(y: pd.Series, threshold: float = 0.3) -> dict:
+    """
+    Checks if a classification target is imbalanced.
+    Returns whether imbalance is detected and the class distribution.
+    """
+    counts = y.value_counts(normalize=True)
+    is_imbalanced = (counts.min() < threshold)
+    return {
+        "is_imbalanced": bool(is_imbalanced),
+        "distribution": counts.to_dict()
+    }
+
+
+def apply_smote(X, y):
+    """Applies SMOTE oversampling to balance classes. X must already be numeric (post-encoding)."""
+    from imblearn.over_sampling import SMOTE
+    smote = SMOTE(random_state=42)
+    X_res, y_res = smote.fit_resample(X, y)
+    return X_res, y_res
+
